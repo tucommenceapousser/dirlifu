@@ -1,290 +1,400 @@
-# app.py  — SelfPhotoFinder (démo éthique) — dev: trhacknon
-import os, time, sqlite3, re, io, base64
+"""
+Subdomains -> Files/Endpoints Enumerator (Flask)
+Dev: trhacknon
+
+Features:
+- Accepts list of subdomains (paste or upload)
+- For each subdomain runs in parallel:
+    - waybackurls (if installed) to get historical endpoints
+    - ffuf (if installed) to fuzz common paths (JSON output)
+    - gospider (if installed) to crawl dynamic links
+- Deduplicates & normalizes URLs
+- Verifies URLs asynchronously with httpx (status, size, title)
+- Streams progress via SSE for real-time frontend updates
+- Stores per-task JSON results in ./results/<task_id>.json
+- UI: interactive dashboard (index.html + main.js)
+"""
+import os
+import subprocess
+import json
+import shutil
+import time
+import uuid
 from pathlib import Path
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urljoin
+
+from flask import Flask, render_template, request, jsonify, Response, send_file
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, render_template, send_from_directory, g, url_for
-from flask_cors import CORS
-import requests
-from PIL import Image
-import exifread
-import pytesseract
-import openai
+import httpx
 from bs4 import BeautifulSoup
 
 load_dotenv()
 
-# --- CONFIG ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BING_SEARCH_KEY = os.getenv("BING_SEARCH_KEY")
-OCR_SPACE_KEY = os.getenv("OCR_SPACE_KEY")
-DB_PATH = os.getenv("DATABASE_URL", "data.db")
-UPLOAD_DIR = Path(os.getenv("UPLOAD_FOLDER", "uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-HOST_PUBLIC_URL = os.getenv("HOST_PUBLIC_URL", None)  # ex: https://my-app.example.com
-PURGE_AFTER_DAYS = int(os.getenv("PURGE_AFTER_DAYS", "30"))
+UPLOADS = Path("uploads")
+RESULTS = Path("results")
+WORDLISTS = Path("wordlists")
+UPLOADS.mkdir(exist_ok=True)
+RESULTS.mkdir(exist_ok=True)
+WORDLISTS.mkdir(exist_ok=True)
 
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# default small wordlist (for demo) if none provided
+SMALL_WORDLIST = WORDLISTS / "small-common.txt"
+if not SMALL_WORDLIST.exists():
+    SMALL_WORDLIST.write_text("\n".join([
+        "admin", "login", "dashboard", "api", "config", "index.php", "index.html",
+        "robots.txt", "sitemap.xml", "uploads", "images", "assets", "css", "js"
+    ]))
+
+# Config
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+FFUF_THREADS = int(os.getenv("FFUF_THREADS", "40"))
+FFUF_WORDLIST = os.getenv("FFUF_WORDLIST", str(SMALL_WORDLIST))
+HTTPX_CONCURRENCY = int(os.getenv("HTTPX_CONCURRENCY", "40"))
+VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() in ("1","true","yes")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
-CORS(app)
+# in-memory task store (for demo). In prod, use persistent DB
+TASKS = {}  # task_id -> {status, progress, logs[], result_path}
 
-# --- Simple DB ---
-def get_db():
-    db = getattr(g, "_database", None)
-    if db is None:
-        db = g._database = sqlite3.connect(DB_PATH, check_same_thread=False)
-        db.row_factory = sqlite3.Row
-    return db
+# Helpers
+def has_binary(bin_name):
+    return shutil.which(bin_name) is not None
 
-def init_db():
-    db = get_db()
-    db.execute('''CREATE TABLE IF NOT EXISTS consent_log (
-                    id INTEGER PRIMARY KEY,
-                    timestamp INTEGER,
-                    ip TEXT,
-                    user_agent TEXT,
-                    action TEXT,
-                    meta TEXT
-                )''')
-    db.execute('''CREATE TABLE IF NOT EXISTS uploads (
-                    id INTEGER PRIMARY KEY,
-                    filename TEXT,
-                    timestamp INTEGER,
-                    meta TEXT
-                )''')
-    db.commit()
-
-with app.app_context():
-    init_db()
-
-@app.teardown_appcontext
-def close_db(exc):
-    db = getattr(g, "_database", None)
-    if db is not None:
-        db.close()
-
-def log(action, meta=""):
-    db = get_db()
-    db.execute("INSERT INTO consent_log (timestamp, ip, user_agent, action, meta) VALUES (?, ?, ?, ?, ?)",
-               (int(time.time()), request.remote_addr, request.headers.get("User-Agent",""), action, str(meta)))
-    db.commit()
-
-# --- Helpers ---
-def secure_filename(fn):
-    fn = re.sub(r"[^A-Za-z0-9_.-]", "_", fn)
-    return fn
-
-def save_upload(file_storage):
-    filename = f"{int(time.time())}_{secure_filename(file_storage.filename)}"
-    path = UPLOAD_DIR / filename
-    file_storage.save(path)
-    db = get_db()
-    db.execute("INSERT INTO uploads (filename, timestamp, meta) VALUES (?, ?, ?)",
-               (filename, int(time.time()), ""))
-    db.commit()
-    return filename
-
-# EXIF extraction
-def extract_exif(path: Path):
+def run_cmd_capture(cmd, timeout=120):
+    """Run command, capture stdout. Return (returncode, stdout, stderr)"""
     try:
-        with open(path, "rb") as f:
-            tags = exifread.process_file(f, details=False)
-        return {k: str(v) for k, v in tags.items()}
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False, text=True)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+
+def normalize_url(base, url):
+    """Try to normalize relative or absolute urls into absolute https/http urls."""
+    if not url:
+        return None
+    url = url.strip()
+    # if it's already absolute
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    # if url begins with // -> add scheme
+    if url.startswith("//"):
+        return "https:" + url
+    # relative path
+    if url.startswith("/"):
+        parsed = urlparse(base)
+        scheme = parsed.scheme or "https"
+        return f"{scheme}://{parsed.netloc}{url}"
+    # otherwise join
+    return urljoin(base, url)
+
+async def fetch_meta(client: httpx.AsyncClient, url: str):
+    """Fetch URL and return metadata (status, size, title)"""
+    try:
+        r = await client.get(url, follow_redirects=True, timeout=20)
+        ct = r.headers.get("content-type","")
+        size = len(r.content or b"")
+        title = ""
+        if "text/html" in ct and size > 0:
+            try:
+                soup = BeautifulSoup(r.text, "html.parser")
+                if soup.title and soup.title.string:
+                    title = soup.title.string.strip()
+            except Exception:
+                title = ""
+        return {"url": url, "status_code": r.status_code, "content_type": ct, "size": size, "title": title}
     except Exception as e:
-        return {"error": str(e)}
+        return {"url": url, "error": str(e)}
 
-# OCR (local pytesseract first, fallback to OCR.space if configured)
-def do_ocr(path: Path):
-    text = ""
-    try:
-        img = Image.open(path)
-        text_local = pytesseract.image_to_string(img)
-        if text_local and text_local.strip():
-            text += text_local.strip()
-    except Exception:
-        text = ""
+async def verify_urls_async(urls):
+    """Verify many urls concurrently using httpx AsyncClient"""
+    limits = httpx.Limits(max_connections=HTTPX_CONCURRENCY, max_keepalive_connections=HTTPX_CONCURRENCY)
+    async with httpx.AsyncClient(verify=VERIFY_SSL, limits=limits, timeout=30) as client:
+        tasks = [fetch_meta(client, u) for u in urls]
+        results = []
+        # run in batches to avoid creating thousands at once
+        BATCH = 200
+        for i in range(0, len(tasks), BATCH):
+            batch = tasks[i:i+BATCH]
+            res = await httpx.gather(*batch, return_exceptions=True) if hasattr(httpx, "gather") else await __gather_emulation(batch)
+            # httpx.gather may not exist depending on version; fall back
+            # But to be robust, run sequentially:
+            if isinstance(res, Exception) or res is None:
+                # fallback sequential
+                for t in batch:
+                    r = await t
+                    results.append(r)
+            else:
+                results.extend(res)
+        return results
 
-    if not text and OCR_SPACE_KEY:
+# fallback gather emulation if needed
+async def __gather_emulation(tasks):
+    out = []
+    for t in tasks:
         try:
-            with open(path, "rb") as f:
-                r = requests.post("https://api.ocr.space/parse/image",
-                                  files={"file": f},
-                                  data={"apikey": OCR_SPACE_KEY, "language": "eng"})
-            j = r.json()
-            parsed = " ".join([p.get("ParsedText","") for p in j.get("ParsedResults",[])]) if j.get("ParsedResults") else ""
-            if parsed:
-                text = parsed
-        except Exception:
-            pass
-    return text
-
-# OpenAI description/summary (non-identifying)
-def openai_describe(ocr_text, notes=""):
-    if not OPENAI_API_KEY:
-        return "OpenAI non configuré."
-    prompt = (
-        "Tu es un assistant qui aide un utilisateur à vérifier si sa photo apparaît sur Internet.\n"
-        "Ne tente **jamais** d'identifier une personne. Donne :\n"
-        "1) Description non-identifiante de l'image (objets, contexte, couleurs). 2) Indique si du texte a été détecté et affiche-le. 3) 5 recommandations de sécurité/actions si la photo est trouvée ailleurs.\n\n"
-        f"Texte OCR détecté:\n{ocr_text}\n\nNotes: {notes}\n\nRéponse concise."
-    )
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
-            max_tokens=450,
-            temperature=0.1
-        )
-        return resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Erreur OpenAI: {e}"
-
-# --- Reverse image search: Bing Visual Search (recommended) ---
-def bing_visual_search(path: Path):
-    if not BING_SEARCH_KEY:
-        return {"error": "BING_SEARCH_KEY not configured"}
-    url = "https://api.bing.microsoft.com/v7.0/images/visualsearch"
-    headers = {"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY}
-    with open(path, "rb") as f:
-        files = {"image": ("image.jpg", f, "application/octet-stream")}
-        try:
-            r = requests.post(url, headers=headers, files=files, timeout=30)
-            if r.status_code != 200:
-                return {"error": "bing_error", "detail": r.text}
-            data = r.json()
-            # Extract useful results (pages)
-            results = []
-            # look under tags -> actions
-            for tag in data.get("tags", []):
-                for action in tag.get("actions", []):
-                    # pages including may have 'webSearchUrl' etc
-                    url_ = action.get("webSearchUrl") or action.get("hostPageDisplayUrl") or action.get("thumbnailUrl")
-                    name = action.get("displayName") or ""
-                    if url_:
-                        results.append({"name": name, "url": url_})
-            # Also try to parse 'visuallySimilarImages' or 'imageInsightsToken' pages
-            return {"raw": data, "extracted": results}
+            r = await t
+            out.append(r)
         except Exception as e:
-            return {"error": str(e)}
+            out.append({"error": str(e)})
+    return out
 
-# --- Fallback helpers: provide direct search-by-image links ---
-def url_for_image_search_by_url(image_url):
-    # Yandex / Google / Bing (by url)
-    links = {}
-    if image_url:
-        links["google"] = f"https://www.google.com/searchbyimage?image_url={image_url}"
-        links["yandex"] = f"https://yandex.com/images/search?rpt=imageview&img_url={image_url}"
-        # Bing can accept image URL as a parameter in web UI, but recommend API usage
-        links["bing_web"] = f"https://www.bing.com/images/search?q=imgurl:{image_url}&view=detailv2"
-    return links
+# Core per-subdomain worker
+def process_subdomain(subdomain, task_id):
+    """
+    Steps per subdomain:
+      - waybackurls (echo subdomain | waybackurls)
+      - ffuf (http and https) with provided wordlist (if ffuf installed)
+      - gospider (if installed)
+      - collect urls, dedup, return list
+    """
+    task = TASKS[task_id]
+    log = task["logs"]
+    log.append(f"[{subdomain}] start processing")
+    found = set()
 
-# --- Routes ---
+    base_http = f"http://{subdomain}"
+    base_https = f"https://{subdomain}"
+
+    # 1) waybackurls
+    if has_binary("waybackurls"):
+        log.append(f"[{subdomain}] running waybackurls...")
+        rc, out, err = run_cmd_capture(["bash","-lc", f"echo {subdomain} | waybackurls"], timeout=120)
+        if rc == 0 and out:
+            for line in out.splitlines():
+                line=line.strip()
+                if line:
+                    found.add(line)
+        else:
+            log.append(f"[{subdomain}] waybackurls error: {err[:200]}")
+    else:
+        log.append(f"[{subdomain}] waybackurls not installed, skipping")
+
+    # 2) gospider
+    if has_binary("gospider"):
+        log.append(f"[{subdomain}] running gospider (short crawl)...")
+        # gospider can write to output folder, but we capture stdout
+        cmd = ["gospider", "-s", base_https, "-d", "2", "--only-headers=false", "--timeout", "10"]
+        rc, out, err = run_cmd_capture(cmd, timeout=60)
+        if rc == 0 and out:
+            # extract urls from stdout (simple heuristic)
+            for line in out.splitlines():
+                if line.strip().startswith("http"):
+                    found.add(line.strip())
+        else:
+            log.append(f"[{subdomain}] gospider error/timeout or empty (rc={rc})")
+    else:
+        log.append(f"[{subdomain}] gospider not installed, skipping")
+
+    # 3) ffuf (fuzz common paths) -> run both http and https
+    if has_binary("ffuf"):
+        log.append(f"[{subdomain}] running ffuf (fuzz) using {FFUF_WORDLIST}...")
+        for scheme in ("http","https"):
+            target = f"{scheme}://{subdomain}/FUZZ"
+            out_json = UPLOADS / f"ffuf_{subdomain}_{scheme}.json"
+            cmd = [
+                "ffuf",
+                "-u", target,
+                "-w", FFUF_WORDLIST,
+                "-t", str(FFUF_THREADS),
+                "-mc", "200,301,302,403,401",
+                "-of", "json",
+                "-o", str(out_json)
+            ]
+            rc, o, e = run_cmd_capture(cmd, timeout=180)
+            if rc == 0 and out_json.exists():
+                try:
+                    j = json.loads(out_json.read_text())
+                    # ffuf json schema: "results" list with "url"
+                    for r in j.get("results", []):
+                        u = r.get("url")
+                        if u:
+                            found.add(u)
+                except Exception as ex:
+                    log.append(f"[{subdomain}] ffuf parse error: {ex}")
+            else:
+                log.append(f"[{subdomain}] ffuf {scheme} error or no output (rc={rc})")
+    else:
+        log.append(f"[{subdomain}] ffuf not installed, skipping")
+
+    # 4) Basic probe: try common files directly (quick sweep)
+    quick_common = ["robots.txt","sitemap.xml",".env","admin","login","index.php","index.html"]
+    for p in quick_common:
+        found.add(f"https://{subdomain}/{p}")
+
+    # normalize URLs
+    normalized = set()
+    for u in list(found):
+        n = normalize_url(f"https://{subdomain}", u)
+        if n:
+            normalized.add(n)
+
+    log.append(f"[{subdomain}] collected {len(normalized)} candidate urls")
+    return list(sorted(normalized))
+
+# Task runner (runs in background thread via executor)
+def run_task(task_id, subdomains):
+    TASKS[task_id]["status"] = "running"
+    TASKS[task_id]["progress"] = 0
+    TASKS[task_id]["logs"].append(f"Task {task_id} started with {len(subdomains)} subdomains")
+    results_by_sub = {}
+    start = time.time()
+
+    # per-subdomain parallel processing using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_to_sub = {ex.submit(process_subdomain, sd, task_id): sd for sd in subdomains}
+        for i, fut in enumerate(as_completed(future_to_sub)):
+            sd = future_to_sub[fut]
+            try:
+                urls = fut.result()
+            except Exception as e:
+                TASKS[task_id]["logs"].append(f"[{sd}] worker error: {e}")
+                urls = []
+            results_by_sub[sd] = urls
+            # update progress
+            TASKS[task_id]["progress"] = int((i+1)/len(subdomains)*80)  # 0-80% for collection
+            TASKS[task_id]["logs"].append(f"[{sd}] done, {len(urls)} urls")
+    TASKS[task_id]["logs"].append("Collection phase complete. Starting verification (httpx)...")
+
+    # Merge and deduplicate all URLs
+    all_urls = set()
+    for sd, lst in results_by_sub.items():
+        for u in lst:
+            all_urls.add(u)
+    all_urls = sorted(all_urls)
+    TASKS[task_id]["logs"].append(f"Total unique urls before verification: {len(all_urls)}")
+
+    # Verify URLs asynchronously using httpx
+    # create event loop and run verification
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    async def verify_and_store():
+        # limit concurrency
+        client = httpx.AsyncClient(verify=VERIFY_SSL, timeout=30, limits=httpx.Limits(max_connections=HTTPX_CONCURRENCY))
+        sem = asyncio.Semaphore(HTTPX_CONCURRENCY)
+        results = []
+
+        async def bounded_fetch(u):
+            async with sem:
+                try:
+                    r = await client.get(u, follow_redirects=True)
+                    size = len(r.content or b"")
+                    title = ""
+                    ct = r.headers.get("content-type","")
+                    if "html" in ct.lower() and size>0:
+                        try:
+                            soup = BeautifulSoup(r.text, "html.parser")
+                            if soup.title and soup.title.string:
+                                title = soup.title.string.strip()
+                        except Exception:
+                            title = ""
+                    return {"url": u, "status": r.status_code, "content_type": ct, "size": size, "title": title}
+                except Exception as e:
+                    return {"url": u, "error": str(e)}
+        tasks = [bounded_fetch(u) for u in all_urls]
+        # run in chunks
+        B = 200
+        for i in range(0, len(tasks), B):
+            chunk = tasks[i:i+B]
+            res = await asyncio.gather(*chunk, return_exceptions=True)
+            for r in res:
+                results.append(r)
+        await client.aclose()
+        return results
+
+    try:
+        verified = loop.run_until_complete(verify_and_store())
+    except Exception as e:
+        TASKS[task_id]["logs"].append(f"Verification error: {e}")
+        verified = []
+    finally:
+        loop.close()
+
+    # store final structured results
+    out = {
+        "task_id": task_id,
+        "started_at": start,
+        "finished_at": time.time(),
+        "subdomains": results_by_sub,
+        "all_urls_count": len(all_urls),
+        "verified": verified
+    }
+    out_path = RESULTS / f"{task_id}.json"
+    out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
+    TASKS[task_id]["result_path"] = str(out_path)
+    TASKS[task_id]["status"] = "finished"
+    TASKS[task_id]["progress"] = 100
+    TASKS[task_id]["logs"].append(f"Task {task_id} finished. Results saved to {out_path}")
+    return
+
+# Flask routes
 @app.route("/")
 def index():
-    return render_template("index.html", dev_name="trhacknon")
+    return render_template("index.html", dev="trhacknon")
 
-@app.route("/upload_photo", methods=["POST"])
-def upload_photo():
-    # consent
-    consent = request.form.get("consent")
-    if not consent or consent not in ("yes","true","on"):
-        return jsonify({"error":"consent_required"}), 400
-    f = request.files.get("photo")
-    if not f:
-        return jsonify({"error":"no_file"}), 400
-    filename = save_upload(f)
-    log("photo_upload", meta=filename)
-    return jsonify({"status":"ok", "filename": filename, "url": url_for("uploads_static", filename=filename, _external=True)})
-
-@app.route("/describe_and_search", methods=["POST"])
-def describe_and_search():
+@app.route("/start_scan", methods=["POST"])
+def start_scan():
     """
-    JSON body: { "filename": "<saved filename>", "use_bing": true/false, "use_yandex": true/false, "consent": true }
+    JSON: { "subdomains": ["a.example.com","b.example.com"], "max_workers": int, "use_examples": bool }
     """
     data = request.get_json(force=True)
-    if not data.get("consent"):
-        return jsonify({"error":"consent_required"}), 400
-    filename = data.get("filename")
-    if not filename:
-        return jsonify({"error":"missing_filename"}), 400
-    path = UPLOAD_DIR / filename
-    if not path.exists():
-        return jsonify({"error":"not_found"}), 404
+    subs = data.get("subdomains") or []
+    if isinstance(subs, str):
+        # allow newline separated paste
+        subs = [s.strip() for s in subs.splitlines() if s.strip()]
+    subs = list(dict.fromkeys([s.strip() for s in subs if s.strip()]))
+    if not subs:
+        return jsonify({"error":"no_subdomains"}), 400
+    task_id = uuid.uuid4().hex[:12]
+    TASKS[task_id] = {"status":"queued","progress":0,"logs":[f"Queued task {task_id}"], "result_path": None}
+    # allow override workers
+    global MAX_WORKERS
+    mw = data.get("max_workers")
+    if isinstance(mw, int) and mw>0:
+        TASKS[task_id]["logs"].append(f"Setting max_workers={mw}")
+        MAX_WORKERS = mw
 
-    log("describe_and_search", meta=filename)
+    # launch background thread
+    from threading import Thread
+    t = Thread(target=run_task, args=(task_id, subs), daemon=True)
+    t.start()
+    return jsonify({"task_id": task_id})
 
-    # EXIF
-    exif = extract_exif(path)
+@app.route("/task_status/<task_id>")
+def task_status(task_id):
+    t = TASKS.get(task_id)
+    if not t:
+        return jsonify({"error":"task_not_found"}), 404
+    return jsonify({"status": t["status"], "progress": t.get("progress",0), "logs": t.get("logs", [])[:30], "result_path": t.get("result_path")})
 
-    # OCR
-    ocr_text = do_ocr(path)
+@app.route("/stream/<task_id>")
+def stream(task_id):
+    """SSE stream for live logs"""
+    def event_stream():
+        last_index = 0
+        while True:
+            if task_id not in TASKS:
+                yield f"data: {json.dumps({'error':'task_not_found'})}\n\n"
+                break
+            logs = TASKS[task_id]["logs"]
+            if last_index < len(logs):
+                for entry in logs[last_index:]:
+                    payload = {"log": entry, "progress": TASKS[task_id].get("progress",0), "status": TASKS[task_id].get("status")}
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                last_index = len(logs)
+            if TASKS[task_id]["status"] in ("finished","error"):
+                break
+            time.sleep(0.7)
+    return Response(event_stream(), mimetype="text/event-stream")
 
-    # OpenAI description/summary
-    ai_desc = openai_describe(ocr_text=ocr_text, notes=f"filename={filename}")
-
-    # Bing search
-    bing_res = None
-    if data.get("use_bing", True):
-        bing_res = bing_visual_search(path)
-
-    # Public URL (if available)
-    public_url = None
-    if HOST_PUBLIC_URL:
-        public_url = f"{HOST_PUBLIC_URL.rstrip('/')}/{url_for('uploads_static', filename=filename).lstrip('/')}"
-    else:
-        public_url = url_for('uploads_static', filename=filename, _external=True)
-
-    # Links for Google/Yandex by URL
-    search_links = url_for_image_search_by_url(public_url)
-
-    return jsonify({
-        "filename": filename,
-        "public_url": public_url,
-        "exif": exif,
-        "ocr_text": ocr_text,
-        "openai_description": ai_desc,
-        "bing": bing_res,
-        "search_links": search_links
-    })
-
-@app.route("/uploads/<path:filename>")
-def uploads_static(filename):
-    return send_from_directory(UPLOAD_DIR, filename, as_attachment=False)
-
-@app.route("/delete_data", methods=["POST"])
-def delete_data():
-    # For demo, delete all uploads & logs — in production, require auth
-    db = get_db()
-    rows = db.execute("SELECT filename FROM uploads").fetchall()
-    deleted = []
-    for r in rows:
-        p = UPLOAD_DIR / r["filename"]
-        if p.exists():
-            try:
-                p.unlink()
-                deleted.append(r["filename"])
-            except Exception:
-                pass
-    db.execute("DELETE FROM uploads")
-    db.execute("DELETE FROM consent_log")
-    db.commit()
-    return jsonify({"status":"deleted", "files_deleted": deleted})
-
-@app.route("/purge_old", methods=["POST"])
-def purge_old():
-    cutoff = int((datetime.utcnow() - timedelta(days=PURGE_AFTER_DAYS)).timestamp())
-    db = get_db()
-    rows = db.execute("SELECT id, filename, timestamp FROM uploads WHERE timestamp < ?", (cutoff,)).fetchall()
-    deleted = []
-    for r in rows:
-        p = UPLOAD_DIR / r["filename"]
-        if p.exists(): p.unlink()
-        db.execute("DELETE FROM uploads WHERE id = ?", (r["id"],))
-        deleted.append(r["filename"])
-    db.commit()
-    return jsonify({"deleted": deleted})
+@app.route("/download/<task_id>")
+def download(task_id):
+    t = TASKS.get(task_id)
+    if not t or not t.get("result_path"):
+        return jsonify({"error":"not_ready"}), 404
+    return send_file(t["result_path"], as_attachment=True, download_name=f"{task_id}.json")
 
 if __name__ == "__main__":
+    # run dev server
     app.run(host="0.0.0.0", port=5000, debug=True)
