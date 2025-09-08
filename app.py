@@ -39,7 +39,7 @@ RESULTS.mkdir(exist_ok=True)
 WORDLISTS.mkdir(exist_ok=True)
 
 # default small wordlist (for demo) if none provided
-SMALL_WORDLIST = WORDLISTS / "small-common.txt"
+SMALL_WORDLIST = WORDLISTS / "trhacknon_wordlist.txt"
 if not SMALL_WORDLIST.exists():
     SMALL_WORDLIST.write_text("\n".join([
         "admin", "login", "dashboard", "api", "config", "index.php", "index.html",
